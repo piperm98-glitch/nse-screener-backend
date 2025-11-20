@@ -1,13 +1,15 @@
-// ================= KITE SCREENER BACKEND (FINAL VERSION) =================
+// ================================================================
+//  NSE SCREENER BACKEND (Kite Connect + Supabase + Socket.IO)
+// ================================================================
 
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
-import WebSocket from "ws";
+import { KiteTicker } from "kiteconnect";
 
-// ------------- ENV VARIABLES -------------
+// --------------------- ENV VARIABLES ---------------------
 const API_KEY = process.env.KITE_API_KEY;
 const API_SECRET = process.env.KITE_API_SECRET;
 const ACCESS_TOKEN = process.env.KITE_ACCESS_TOKEN;
@@ -17,7 +19,7 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// ------------- EXPRESS SERVER -------------
+// --------------------- EXPRESS SERVER ---------------------
 const app = express();
 app.use(cors());
 
@@ -27,10 +29,10 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-// ------------- SUPABASE -------------
+// --------------------- SUPABASE ---------------------
 const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// ------------- TEST ENDPOINT -------------
+// --------------------- HEALTH CHECK ---------------------
 app.get("/", (req, res) => {
   res.json({
     status: "Kite Backend Running",
@@ -38,9 +40,8 @@ app.get("/", (req, res) => {
   });
 });
 
-// ------------- INSTRUMENT TOKENS (IMPORTANT) -------------
-// Replace these with the REAL numeric tokens for stocks you want.
-// I will generate these for you once you give me your watchlist.
+// --------------------- INSTRUMENT TOKENS ---------------------
+// Add more tokens anytime. These MUST be numeric instrument tokens.
 const TOKENS = [
   738561,     // RELIANCE
   2953217,    // TCS
@@ -50,16 +51,26 @@ const TOKENS = [
   779521      // SBIN
 ];
 
-// ------------------- ALERT SETTINGS -------------------
+// --------------------- SYMBOL MAP ---------------------
+const SYMBOLS = [
+  "RELIANCE",
+  "TCS",
+  "INFY",
+  "HDFCBANK",
+  "ICICIBANK",
+  "SBIN"
+];
+
+// --------------------- ALERT SETTINGS ---------------------
 const settings = {
   relVolThreshold: 1.5,
   changePctThreshold: 2,
-  cooldownMs: 15000,
+  cooldownMs: 15000
 };
 
-const state = {}; // symbol → local state
+const state = {}; // Stores last known data per symbol
 
-// ------------------- SUPABASE LOG ---------------------
+// --------------------- SUPABASE LOG ---------------------
 async function logAlert(symbol, price, criteria) {
   await supabase.from("nse_screener_alerts").insert([
     {
@@ -72,51 +83,40 @@ async function logAlert(symbol, price, criteria) {
   ]);
 }
 
-// ------------------- KITE WEBSOCKET --------------------
-function startKiteWS() {
-  const ws = new WebSocket("wss://ws.kite.trade/?api_key=" + API_KEY + "&access_token=" + ACCESS_TOKEN);
-
-  ws.on("open", () => {
-    console.log("Kite WebSocket Connected");
-
-    // Subscribe to ticks
-    ws.send(
-      JSON.stringify({
-        a: "subscribe",
-        v: TOKENS
-      })
-    );
-
-    // Mode: full ticks
-    ws.send(
-      JSON.stringify({
-        a: "mode",
-        v: ["full", TOKENS]
-      })
-    );
+// ================================================================
+//                    KITE TICKER (THE CORRECT WAY)
+// ================================================================
+function startTicker() {
+  const ticker = new KiteTicker({
+    api_key: API_KEY,
+    access_token: ACCESS_TOKEN
   });
 
-  ws.on("message", (msg) => {
-    const data = JSON.parse(msg);
+  ticker.connect();
 
-    if (!data.data) return;
+  ticker.on("connect", () => {
+    console.log("Kite WebSocket Connected");
 
-    data.data.forEach(async (tick) => {
+    // Subscribe to tokens
+    ticker.subscribe(TOKENS);
+
+    // Full tick data (OHLC, Volume, etc.)
+    ticker.setMode(ticker.modeFull, TOKENS);
+  });
+
+  ticker.on("ticks", async (ticks) => {
+    ticks.forEach(async (tick) => {
       const token = tick.instrument_token;
-      if (!token) return;
+      const index = TOKENS.indexOf(token);
+      if (index === -1) return;
 
+      const symbol = SYMBOLS[index];
       const price = tick.last_price;
       const volume = tick.volume;
       const prevHigh = tick.ohlc?.high || price * 1.01;
       const prevLow = tick.ohlc?.low || price * 0.99;
 
-      // Map token → symbol manually
-      const index = TOKENS.indexOf(token);
-      const symbol = ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN"][index];
-
-      if (!symbol) return;
-
-      // initialize local state
+      // Initialize state
       if (!state[symbol]) {
         state[symbol] = {
           prevPrice: price,
@@ -129,6 +129,7 @@ function startKiteWS() {
       }
 
       const st = state[symbol];
+
       st.prevPrice = st.price ?? price;
       st.price = price;
       st.volume = volume;
@@ -137,7 +138,7 @@ function startKiteWS() {
       const mid = (st.prevDayHigh + st.prevDayLow) / 2;
       st.changePct = ((st.price - mid) / mid) * 100;
 
-      // ---------------- ALERT LOGIC ----------------
+      // ---------------- ALERT CONDITIONS ----------------
       const crossedHigh =
         st.prevPrice <= st.prevDayHigh && st.price > st.prevDayHigh;
 
@@ -148,9 +149,10 @@ function startKiteWS() {
 
       st.lastAlertAt = Date.now();
 
-      const msgText = `High Cross + RelVol>${settings.relVolThreshold} + Change%>${settings.changePctThreshold}`;
+      const msgText =
+        `High Cross + RelVol>${settings.relVolThreshold} + Change%>${settings.changePctThreshold}`;
 
-      // Log to supabase
+      // Log to Supabase
       await logAlert(symbol, st.price, msgText);
 
       // Emit to frontend
@@ -165,18 +167,18 @@ function startKiteWS() {
     });
   });
 
-  ws.on("close", () => {
-    console.log("Kite WS closed — reconnecting in 3s");
-    setTimeout(startKiteWS, 3000);
-  });
+  ticker.on("error", (err) => console.error("Kite WS Error:", err));
 
-  ws.on("error", (err) => console.error("Kite WS Error:", err));
+  ticker.on("disconnect", () => {
+    console.log("Ticker disconnected — reconnecting in 3s...");
+    setTimeout(startTicker, 3000);
+  });
 }
 
-startKiteWS();
+startTicker();
 
 // ------------------- SOCKET.IO --------------------
-io.on("connection", socket => {
+io.on("connection", (socket) => {
   console.log("Frontend connected:", socket.id);
 });
 
