@@ -1,144 +1,129 @@
+// ================= KITE SCREENER BACKEND (FINAL VERSION) =================
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
-import fetch from "node-fetch";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 
-// ---------------- ENV VARIABLES ----------------
+// ------------- ENV VARIABLES -------------
 const API_KEY = process.env.KITE_API_KEY;
 const API_SECRET = process.env.KITE_API_SECRET;
 const ACCESS_TOKEN = process.env.KITE_ACCESS_TOKEN;
+
 const PORT = process.env.PORT || 3000;
-const SUPABASE_URL = process.env.SUPABASE_URL
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY
 
-// -------------- SUPABASE (server-side) --------------
-const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// -------------- EXPRESS + SOCKET.IO -----------------
+// ------------- EXPRESS SERVER -------------
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "*"
-  }
+  cors: { origin: "*" }
 });
 
-// -------------- SIMPLE STATUS ENDPOINT --------------
+// ------------- SUPABASE -------------
+const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// ------------- TEST ENDPOINT -------------
 app.get("/", (req, res) => {
   res.json({
-    status: "Backend running",
-    time: new Date().toISOString(),
+    status: "Kite Backend Running",
+    time: new Date().toISOString()
   });
 });
 
-// -------------- WATCHLIST (YOU MAY EDIT) --------------
-const INSTRUMENTS = [
-  "NSE_EQ|RELIANCE",
-  "NSE_EQ|TCS",
-  "NSE_EQ|INFY",
-  "NSE_EQ|HDFCBANK",
-  "NSE_EQ|ICICIBANK",
-  "NSE_EQ|SBIN",
+// ------------- INSTRUMENT TOKENS (IMPORTANT) -------------
+// Replace these with the REAL numeric tokens for stocks you want.
+// I will generate these for you once you give me your watchlist.
+const TOKENS = [
+  738561,     // RELIANCE
+  2953217,    // TCS
+  408065,     // INFY
+  341249,     // HDFCBANK
+  1270529,    // ICICIBANK
+  779521      // SBIN
 ];
 
-// -------------- ALERT FILTER SETTINGS --------------
+// ------------------- ALERT SETTINGS -------------------
 const settings = {
   relVolThreshold: 1.5,
   changePctThreshold: 2,
-  highCross: true,
-  cooldownMs: 15000
+  cooldownMs: 15000,
 };
 
-// -------------- INTERNAL STATE --------------
-const state = {}; // per-symbol memory
+const state = {}; // symbol → local state
 
-// -------------- SUPABASE LOGGING --------------
-async function logAlert(symbol, price, msg) {
-  const { error } = await supabase
-    .from("nse_screener_alerts")
-    .insert([
-      {
-        timestamp: new Date().toISOString(),
-        symbol,
-        price,
-        criteria_hit: msg,
-        user_id: "server"
-      },
-    ]);
-
-  if (error) console.error("Supabase Error:", error);
-}
-
-// -------------- UPSTOX WEBSOCKET LOGIC --------------
-// Render does not allow WebSocket outbound easily in free tier,
-// so we will first fetch AUTHORIZED URL from Upstox REST API:
-
-async function getUpstoxWsUrl() {
-  const res = await fetch(
-    "https://api.upstox.com/v2/market-data/feed/authorize",
+// ------------------- SUPABASE LOG ---------------------
+async function logAlert(symbol, price, criteria) {
+  await supabase.from("nse_screener_alerts").insert([
     {
-      headers: {
-        Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}`
-      }
+      timestamp: new Date().toISOString(),
+      symbol,
+      price,
+      criteria_hit: criteria,
+      user_id: "server"
     }
-  );
-
-  const json = await res.json();
-  return json.data.authorizedRedirectUri;
+  ]);
 }
 
-async function startUpstoxStream() {
-  const wsUrl = await getUpstoxWsUrl();
-  console.log("Upstox WS URL:", wsUrl);
-
-  const WebSocket = (await import("ws")).default;
-  const ws = new WebSocket(wsUrl);
+// ------------------- KITE WEBSOCKET --------------------
+function startKiteWS() {
+  const ws = new WebSocket("wss://ws.kite.trade/?api_key=" + API_KEY + "&access_token=" + ACCESS_TOKEN);
 
   ws.on("open", () => {
-    console.log("Upstox WebSocket Connected");
+    console.log("Kite WebSocket Connected");
 
+    // Subscribe to ticks
     ws.send(
       JSON.stringify({
-        guid: "abc-123",
-        method: "sub",
-        data: {
-          mode: "full",
-          instrumentKeys: INSTRUMENTS
-        }
+        a: "subscribe",
+        v: TOKENS
+      })
+    );
+
+    // Mode: full ticks
+    ws.send(
+      JSON.stringify({
+        a: "mode",
+        v: ["full", TOKENS]
       })
     );
   });
 
-  ws.on("message", async (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch (e) {
-      return;
-    }
+  ws.on("message", (msg) => {
+    const data = JSON.parse(msg);
 
-    if (!data?.data?.feeds) return;
+    if (!data.data) return;
 
-    Object.values(data.data.feeds).forEach(async (tick) => {
-      const symbol = tick?.instrumentKey?.split("|")[1];
+    data.data.forEach(async (tick) => {
+      const token = tick.instrument_token;
+      if (!token) return;
+
+      const price = tick.last_price;
+      const volume = tick.volume;
+      const prevHigh = tick.ohlc?.high || price * 1.01;
+      const prevLow = tick.ohlc?.low || price * 0.99;
+
+      // Map token → symbol manually
+      const index = TOKENS.indexOf(token);
+      const symbol = ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN"][index];
+
       if (!symbol) return;
 
-      const price = tick?.ltp || 0;
-      const volume = tick?.volume || 0;
-      const prevHigh = tick?.ohlc?.prevHigh || price * 1.01;
-      const prevLow = tick?.ohlc?.prevLow || price * 0.99;
-
+      // initialize local state
       if (!state[symbol]) {
         state[symbol] = {
           prevPrice: price,
           prevDayHigh: prevHigh,
           prevDayLow: prevLow,
           avgVolume: volume || 1000,
-          lastAlertAt: 0,
+          lastAlertAt: 0
         };
         return;
       }
@@ -152,29 +137,23 @@ async function startUpstoxStream() {
       const mid = (st.prevDayHigh + st.prevDayLow) / 2;
       st.changePct = ((st.price - mid) / mid) * 100;
 
-      // ALERT LOGIC
-      let triggered = false;
+      // ---------------- ALERT LOGIC ----------------
+      const crossedHigh =
+        st.prevPrice <= st.prevDayHigh && st.price > st.prevDayHigh;
 
-      if (settings.highCross) {
-        if (st.prevPrice <= st.prevDayHigh && st.price > st.prevDayHigh) {
-          triggered = true;
-        }
-      }
-
-      if (!triggered) return;
-
+      if (!crossedHigh) return;
       if (st.relativeVolume <= settings.relVolThreshold) return;
       if (st.changePct <= settings.changePctThreshold) return;
-
       if (Date.now() - st.lastAlertAt < settings.cooldownMs) return;
+
       st.lastAlertAt = Date.now();
 
-      const msgText = `High Cross + RelVol > ${settings.relVolThreshold} + Change% > ${settings.changePctThreshold}`;
+      const msgText = `High Cross + RelVol>${settings.relVolThreshold} + Change%>${settings.changePctThreshold}`;
 
-      // SAVE TO SUPABASE
+      // Log to supabase
       await logAlert(symbol, st.price, msgText);
 
-      // SEND TO ALL CONNECTED CLIENTS
+      // Emit to frontend
       io.emit("alert", {
         symbol,
         price: st.price,
@@ -186,16 +165,22 @@ async function startUpstoxStream() {
     });
   });
 
-  ws.on("close", () => console.log("Upstox WS Closed"));
-  ws.on("error", (err) => console.error("Upstox WS Error:", err));
+  ws.on("close", () => {
+    console.log("Kite WS closed — reconnecting in 3s");
+    setTimeout(startKiteWS, 3000);
+  });
+
+  ws.on("error", (err) => console.error("Kite WS Error:", err));
 }
 
-startUpstoxStream();
+startKiteWS();
 
-// -------------- SOCKET.IO CONNECTIONS --------------
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+// ------------------- SOCKET.IO --------------------
+io.on("connection", socket => {
+  console.log("Frontend connected:", socket.id);
 });
 
-// -------------- START SERVER --------------
-server.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+// ------------------- START SERVER --------------------
+server.listen(PORT, () => {
+  console.log(`Backend live on port ${PORT}`);
+});
