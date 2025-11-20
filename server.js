@@ -10,6 +10,8 @@ const API_KEY = process.env.KITE_API_KEY;
 const API_SECRET = process.env.KITE_API_SECRET;
 const ACCESS_TOKEN = process.env.KITE_ACCESS_TOKEN;
 const PORT = process.env.PORT || 3000;
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY
 
 // -------------- SUPABASE (server-side) --------------
 const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
